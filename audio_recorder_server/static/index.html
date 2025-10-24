@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Audio Recorder</title>
+    <style>
+        :root {
+            color-scheme: dark light;
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        }
+
+        body {
+            margin: 0;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: #10141a;
+            color: #e8eaed;
+        }
+
+        .card {
+            background: rgba(255, 255, 255, 0.06);
+            padding: 2.5rem 3rem;
+            border-radius: 1.25rem;
+            box-shadow: 0 1.5rem 3rem rgba(0, 0, 0, 0.3);
+            width: min(420px, 92vw);
+            backdrop-filter: blur(10px);
+        }
+
+        h1 {
+            font-size: 1.75rem;
+            margin: 0 0 1.25rem;
+            text-align: center;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 0.5rem;
+            font-weight: 600;
+            font-size: 0.95rem;
+        }
+
+        input[type="text"] {
+            width: 100%;
+            padding: 0.75rem 1rem;
+            border-radius: 0.75rem;
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            background: rgba(255, 255, 255, 0.08);
+            color: inherit;
+            font-size: 1rem;
+            margin-bottom: 1.5rem;
+        }
+
+        input[type="text"]:focus {
+            outline: none;
+            border-color: rgba(0, 198, 255, 0.75);
+            box-shadow: 0 0 0 3px rgba(0, 198, 255, 0.25);
+        }
+
+        button {
+            width: 100%;
+            border: none;
+            border-radius: 999px;
+            font-size: 1.15rem;
+            font-weight: 600;
+            padding: 0.85rem 1.5rem;
+            cursor: pointer;
+            transition: transform 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
+        }
+
+        button:disabled {
+            cursor: not-allowed;
+            opacity: 0.6;
+            transform: none;
+            box-shadow: none;
+        }
+
+        button#recordButton {
+            background: linear-gradient(135deg, #ff4d4d, #ff1a75);
+            color: white;
+            box-shadow: 0 1rem 1.75rem rgba(255, 66, 115, 0.35);
+        }
+
+        button#recordButton.recording {
+            background: linear-gradient(135deg, #3238ff, #00c6ff);
+            box-shadow: 0 1rem 1.75rem rgba(50, 56, 255, 0.35);
+            animation: pulse 1s ease-in-out infinite alternate;
+        }
+
+        @keyframes pulse {
+            0% { transform: scale(1); }
+            100% { transform: scale(1.025); }
+        }
+
+        .status {
+            margin: 1.5rem 0 0.5rem;
+            font-size: 0.95rem;
+            text-align: center;
+            min-height: 1.2rem;
+        }
+
+        audio {
+            width: 100%;
+            margin-top: 1.5rem;
+            display: none;
+        }
+    </style>
+</head>
+<body>
+<div class="card">
+    <h1>Record A Clip</h1>
+    <label for="prefixInput">Filename Prefix</label>
+    <input id="prefixInput" type="text" placeholder="Optional prefix (e.g. session1)">
+    <button id="recordButton">Start Recording</button>
+    <div class="status" id="status">Tap the button to start.</div>
+    <audio id="playback" controls></audio>
+</div>
+<script type="module">
+    const recordButton = document.getElementById("recordButton");
+    const statusLabel = document.getElementById("status");
+    const prefixInput = document.getElementById("prefixInput");
+    const playback = document.getElementById("playback");
+
+    let mediaRecorder;
+    let audioChunks = [];
+    let audioContext;
+
+    const updateStatus = (message) => {
+        statusLabel.textContent = message;
+    };
+
+    const ensureAudioContext = () => {
+        if (!audioContext) {
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        }
+        return audioContext;
+    };
+
+    const audioBufferToWav = (buffer) => {
+        const channels = buffer.numberOfChannels;
+        const sampleRate = buffer.sampleRate;
+        const bitDepth = 16;
+        const format = 1; // PCM
+        const bytesPerSample = bitDepth / 8;
+        const blockAlign = channels * bytesPerSample;
+        const dataLength = buffer.length * blockAlign;
+        const bufferLength = 44 + dataLength;
+        const arrayBuffer = new ArrayBuffer(bufferLength);
+        const view = new DataView(arrayBuffer);
+
+        let offset = 0;
+
+        const writeString = (str) => {
+            for (let i = 0; i < str.length; i++) {
+                view.setUint8(offset++, str.charCodeAt(i));
+            }
+        };
+
+        const writeUint32 = (value) => {
+            view.setUint32(offset, value, true);
+            offset += 4;
+        };
+
+        const writeUint16 = (value) => {
+            view.setUint16(offset, value, true);
+            offset += 2;
+        };
+
+        writeString("RIFF");
+        writeUint32(36 + dataLength);
+        writeString("WAVE");
+        writeString("fmt ");
+        writeUint32(16);
+        writeUint16(format);
+        writeUint16(channels);
+        writeUint32(sampleRate);
+        writeUint32(sampleRate * blockAlign);
+        writeUint16(blockAlign);
+        writeUint16(bitDepth);
+        writeString("data");
+        writeUint32(dataLength);
+
+        const channelData = [];
+        for (let channel = 0; channel < channels; channel++) {
+            channelData.push(buffer.getChannelData(channel));
+        }
+
+        const interleaved = new Float32Array(buffer.length * channels);
+        for (let i = 0; i < buffer.length; i++) {
+            for (let channel = 0; channel < channels; channel++) {
+                interleaved[i * channels + channel] = channelData[channel][i];
+            }
+        }
+
+        for (let i = 0; i < interleaved.length; i++, offset += 2) {
+            const sample = Math.max(-1, Math.min(1, interleaved[i]));
+            view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7FFF, true);
+        }
+
+        return new Blob([arrayBuffer], { type: "audio/wav" });
+    };
+
+    const convertToWav = async (blob) => {
+        const arrayBuffer = await blob.arrayBuffer();
+        const context = ensureAudioContext();
+        const audioBuffer = await context.decodeAudioData(arrayBuffer);
+        return audioBufferToWav(audioBuffer);
+    };
+
+    const uploadRecording = async (wavBlob) => {
+        const formData = new FormData();
+        const prefix = prefixInput.value.trim();
+        if (prefix) {
+            formData.append("prefix", prefix);
+        }
+        formData.append("file", wavBlob, "recording.wav");
+
+        updateStatus("Uploading...");
+
+        try {
+            const response = await fetch("/upload", {
+                method: "POST",
+                body: formData,
+            });
+
+            if (!response.ok) {
+                const { detail } = await response.json().catch(() => ({ detail: "Upload failed." }));
+                throw new Error(detail);
+            }
+
+            const result = await response.json();
+            updateStatus(`Saved as ${result.filename}`);
+
+            const wavUrl = URL.createObjectURL(wavBlob);
+            playback.src = wavUrl;
+            playback.style.display = "block";
+        } catch (error) {
+            console.error(error);
+            updateStatus(error.message || "Upload failed.");
+        } finally {
+            recordButton.disabled = false;
+            recordButton.classList.remove("recording");
+            recordButton.textContent = "Start Recording";
+        }
+    };
+
+    const stopRecording = async () => {
+        if (!mediaRecorder) return;
+        mediaRecorder.stop();
+        recordButton.disabled = true;
+        updateStatus("Processing recording...");
+    };
+
+    const startRecording = async () => {
+        if (!navigator.mediaDevices?.getUserMedia) {
+
+            updateStatus("Microphone access is not supported in this browser.");
+            return;
+        }
+
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            mediaRecorder = new MediaRecorder(stream);
+            audioChunks = [];
+
+            mediaRecorder.ondataavailable = (event) => {
+                if (event.data.size > 0) {
+                    audioChunks.push(event.data);
+                }
+            };
+
+            mediaRecorder.onstop = async () => {
+                const blobType = mediaRecorder.mimeType || "audio/webm";
+                const rawBlob = new Blob(audioChunks, { type: blobType });
+                mediaRecorder.stream.getTracks().forEach((track) => track.stop());
+                mediaRecorder = null;
+                audioChunks = [];
+
+                try {
+                    const wavBlob = await convertToWav(rawBlob);
+                    await uploadRecording(wavBlob);
+                } catch (error) {
+                    console.error(error);
+                    updateStatus(error.message || "Failed to process recording.");
+                    recordButton.disabled = false;
+                    recordButton.classList.remove("recording");
+                    recordButton.textContent = "Start Recording";
+                }
+            };
+
+            mediaRecorder.start();
+            recordButton.classList.add("recording");
+            recordButton.textContent = "Stop Recording";
+            updateStatus("Recording... tap to stop.");
+        } catch (error) {
+            console.error(error);
+            updateStatus("Microphone permission denied or unavailable.");
+            recordButton.classList.remove("recording");
+            recordButton.textContent = "Start Recording";
+        }
+    };
+
+    recordButton.addEventListener("click", () => {
+        if (recordButton.classList.contains("recording")) {
+            stopRecording();
+        } else {
+            startRecording();
+        }
+    });
+</script>
+</body>
+</html>
