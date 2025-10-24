@@ -1,5 +1,3 @@
-import asyncio
-import os
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated
@@ -7,16 +5,12 @@ from typing import Annotated
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-import requests
 
 ALLOWED_WAV_CONTENT_TYPES = {"audio/wav", "audio/x-wav"}
 
 APP_ROOT = Path(__file__).resolve().parent
 STATIC_ROOT = APP_ROOT / "static"
 RECORDINGS_ROOT = APP_ROOT / "recordings"
-
-# Endpoint of the local scoring service; configurable via environment variable.
-SCORE_ENDPOINT = os.getenv("SCORE_ENDPOINT", "http://127.0.0.1:9000/score")
 
 # Ensure required folders exist at startup.
 STATIC_ROOT.mkdir(parents=True, exist_ok=True)
@@ -54,34 +48,6 @@ async def persist_upload(file: UploadFile, output_path: Path) -> int:
         raise HTTPException(status_code=400, detail="Uploaded file is empty.")
 
     return total_bytes
-
-
-def request_score(file_path: Path) -> float:
-    """Synchronously call the local scoring endpoint and return the numeric score."""
-    if not SCORE_ENDPOINT:
-        raise RuntimeError("SCORE_ENDPOINT environment variable is not configured.")
-
-    response = requests.post(
-        SCORE_ENDPOINT,
-        json={"file_path": str(file_path)},
-        timeout=30,
-    )
-    response.raise_for_status()
-    payload = response.json()
-
-    if "score" not in payload:
-        raise ValueError("Scoring response missing 'score' field.")
-
-    return float(payload["score"])
-
-
-async def fetch_score(file_path: Path) -> float:
-    """Wrapper that runs the blocking scoring request in a thread."""
-    try:
-        score = await asyncio.to_thread(request_score, file_path)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Scoring service failed: {exc}") from exc
-    return score
 
 
 @app.middleware("http")
@@ -144,7 +110,7 @@ async def upload_audio_with_ids(
     timestamp: Annotated[str, Form(...)],
     file: Annotated[UploadFile, File(...)],
 ) -> JSONResponse:
-    """Upload a WAV file, store it with composite identifiers, and return a score."""
+    """Upload a WAV file and persist it using composite identifiers."""
     if not file.filename:
         raise HTTPException(status_code=400, detail="Uploaded file is missing a filename.")
 
@@ -176,14 +142,11 @@ async def upload_audio_with_ids(
 
     await persist_upload(file, output_path)
 
-    score = await fetch_score(output_path)
-
     return JSONResponse(
         {
-            "message": "Recording saved and scored.",
+            "message": "Recording saved.",
             "filename": output_name,
             "path": str(output_path),
-            "score": score,
         }
     )
 
@@ -194,3 +157,14 @@ app.mount(
     StaticFiles(directory=RECORDINGS_ROOT),
     name="recordings",
 )
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=False,
+    )

@@ -53,6 +53,5 @@ output: HiggsAudioResponse = serve_engine.generate(
 import numpy as np
 import soundfile as sf
 
-# output.audio 是 numpy 数组（[-1, 1] 浮点）；若是 torch.Tensor 先 .cpu().numpy()
 audio = output.audio.astype(np.float32)
 sf.write("output.wav", audio, output.sampling_rate)  # 直接写 WAV (float32)

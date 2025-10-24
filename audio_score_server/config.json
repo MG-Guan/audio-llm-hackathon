@@ -1,0 +1,19 @@
+{
+  "models": [
+    {
+      "key": "whisper-small",
+      "type": "whisper",
+      "model_id": "openai/whisper-small"
+    },
+    {
+      "key": "higgs-audio-v2",
+      "type": "higgs_audio",
+      "model_id": "bosonai/higgs-audio-v2-understanding-3B",
+      "processor_id": "openai/whisper-large-v3-turbo",
+      "transcriber_id": "openai/whisper-small"
+    }
+  ],
+  "video_clip_dir": "../video_clip",
+  "cache_dir": "./cache",
+  "target_sampling_rate": 16000
+}
