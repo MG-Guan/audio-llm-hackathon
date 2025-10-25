@@ -6,6 +6,7 @@ import asyncio
 import io
 import json
 import logging
+import shutil
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -13,10 +14,11 @@ from typing import Any, Dict, Iterable, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 from pydub import AudioSegment
-from transformers import AutoProcessor, WhisperForConditionalGeneration, WhisperProcessor
+from transformers import AutoFeatureExtractor, AutoModel, AutoProcessor, WhisperForConditionalGeneration, WhisperProcessor
 from torchaudio.functional import resample as ta_resample
 
 try:
@@ -46,6 +48,7 @@ class ModelSpec:
     processor_id: str | None = None
     transcriber_id: str | None = None
     sampling_rate: int | None = None
+    style_model_id: str | None = None
 
 
 class BaseModelRunner:
@@ -68,6 +71,28 @@ class BaseModelRunner:
 
     def transcribe_and_embed(self, waveform: np.ndarray, sampling_rate: int) -> Tuple[str, torch.Tensor]:
         raise NotImplementedError
+
+    @staticmethod
+    def _pool_hidden_state(hidden_state: torch.Tensor, attention_mask: torch.Tensor | None) -> torch.Tensor:
+        """Average only valid frames (per attention mask) and L2-normalize."""
+        if hidden_state.dim() != 2:
+            raise ValueError("hidden_state must be 2D [seq, hidden_dim].")
+
+        pooled_source = hidden_state
+        if attention_mask is not None:
+            mask = attention_mask
+            if mask.dim() == 1:
+                mask = mask.unsqueeze(0)
+            mask = mask.to(hidden_state.device, dtype=torch.float32)
+            seq_len = hidden_state.size(0)
+            if mask.size(-1) != seq_len:
+                mask = F.interpolate(mask.unsqueeze(1), size=seq_len, mode="nearest").squeeze(1)
+            mask = mask.squeeze(0) > 0.5
+            if mask.any():
+                pooled_source = hidden_state[mask]
+
+        pooled = pooled_source.mean(dim=0)
+        return F.normalize(pooled, p=2, dim=0)
 
 
 class WhisperModelRunner(BaseModelRunner):
@@ -94,15 +119,104 @@ class WhisperModelRunner(BaseModelRunner):
             sampling_rate=audio_sr,
             return_tensors="pt",
         )
+        attention_mask = getattr(features, "attention_mask", None)
         input_features = features.input_features.to(self.device, dtype=self.model_dtype)
 
         with torch.no_grad():
             encoder_outputs = self.model.model.encoder(input_features=input_features)
-            hidden_state = encoder_outputs.last_hidden_state.squeeze(0).float().cpu()
+            pooled_hidden = self._pool_hidden_state(
+                encoder_outputs.last_hidden_state.squeeze(0),
+                attention_mask,
+            )
+            hidden_state = pooled_hidden.float().cpu()
             generated_ids = self.model.generate(input_features=input_features)
 
         transcript = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
         return transcript, hidden_state
+
+
+class WhisperStyleModelRunner(BaseModelRunner):
+    """Whisper for ASR paired with a Hugging Face speaker/prosody embedding model."""
+
+    DEFAULT_STYLE_MODEL = "microsoft/wavlm-base-plus-sv"
+
+    def __init__(self, spec: ModelSpec, device: torch.device):
+        super().__init__(spec, device)
+        self.model_id = spec.model_id
+        self.processor = WhisperProcessor.from_pretrained(self.model_id)
+        model_kwargs: Dict[str, Any] = {}
+        if device.type == "cuda":
+            model_kwargs["torch_dtype"] = torch.float16
+        self.model = WhisperForConditionalGeneration.from_pretrained(self.model_id, **model_kwargs)
+        self.model.to(self.device)
+        self.model.eval()
+        self.feature_rate = self.processor.feature_extractor.sampling_rate
+        self.model_dtype = self.model.model.encoder.conv1.weight.dtype
+
+        requested_style_model = spec.style_model_id or self.DEFAULT_STYLE_MODEL
+        self.style_sample_rate = spec.sampling_rate or self.feature_rate
+        try:
+            self.style_processor = self._load_hf_processor(requested_style_model)
+            sr = getattr(self.style_processor, "sampling_rate", None)
+            if sr is None:
+                sr = getattr(getattr(self.style_processor, "feature_extractor", None), "sampling_rate", None)
+            if sr is not None:
+                self.style_sample_rate = int(sr)
+            self.style_model = AutoModel.from_pretrained(requested_style_model)
+            self.style_model.to(self.device)
+            self.style_model.eval()
+            self.style_dtype = next(self.style_model.parameters()).dtype
+            self.style_model_id = requested_style_model
+        except Exception as exc:  # pragma: no cover - requires HF download
+            raise RuntimeError(
+                f"Failed to load Hugging Face style model '{requested_style_model}': {exc}"
+            ) from exc
+
+    def transcribe_and_embed(self, waveform: np.ndarray, sampling_rate: int) -> Tuple[str, torch.Tensor]:
+        audio, audio_sr = self._resample_if_needed(waveform, sampling_rate, self.feature_rate)
+
+        features = self.processor(
+            audio,
+            sampling_rate=audio_sr,
+            return_tensors="pt",
+        )
+        input_features = features.input_features.to(self.device, dtype=self.model_dtype)
+
+        with torch.no_grad():
+            generated_ids = self.model.generate(input_features=input_features)
+
+        transcript = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
+
+        style_audio, _ = self._resample_if_needed(waveform, sampling_rate, self.style_sample_rate)
+        hidden_state = self._encode_style_with_hf(style_audio)
+        return transcript, hidden_state
+
+    @staticmethod
+    def _load_hf_processor(model_id: str):
+        try:
+            return AutoProcessor.from_pretrained(model_id)
+        except Exception:
+            return AutoFeatureExtractor.from_pretrained(model_id)
+
+    def _encode_style_with_hf(self, audio: np.ndarray) -> torch.Tensor:
+        if self.style_processor is None or self.style_model is None:
+            raise RuntimeError("Hugging Face style model not initialized.")
+        inputs = self.style_processor(
+            audio,
+            sampling_rate=self.style_sample_rate,
+            return_tensors="pt",
+        )
+        input_values = inputs.get("input_values")
+        if input_values is None:
+            raise RuntimeError("Style processor did not return 'input_values'.")
+        input_values = input_values.to(self.device, dtype=self.style_dtype)
+        with torch.no_grad():
+            outputs = self.style_model(input_values)
+        if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
+            style_vec = outputs.pooler_output
+        else:
+            style_vec = outputs.last_hidden_state.mean(dim=1)
+        return F.normalize(style_vec.squeeze(0), p=2, dim=-1).float().cpu()
 
 
 class HiggsAudioRunner(BaseModelRunner):
@@ -185,7 +299,11 @@ class HiggsAudioRunner(BaseModelRunner):
                 check_seq_length=False,
                 return_dict=True,
             )
-        hidden_state = outputs.last_hidden_state.squeeze(0).float().cpu()
+        pooled_hidden = self._pool_hidden_state(
+            outputs.last_hidden_state.squeeze(0),
+            attention_mask,
+        )
+        hidden_state = pooled_hidden.float().cpu()
         return transcript, hidden_state
 
 
@@ -232,8 +350,11 @@ class AudioScoreService:
         self.target_sr = int(self.config.get("target_sampling_rate", 16000))
 
         self.video_clip_root = (self.app_root / self.config["video_clip_dir"]).resolve()
-        self.cache_root = (self.app_root / self.config["cache_dir"]).resolve()
-        self.cache_root.mkdir(parents=True, exist_ok=True)
+
+        cache_root_path = (self.app_root / self.config["cache_dir"]).resolve()
+        self._flush_cache_root(cache_root_path)
+        cache_root_path.mkdir(parents=True, exist_ok=True)
+        self.cache_root = cache_root_path
 
         if not self.video_clip_root.exists():
             raise RuntimeError(f"Video clip directory not found: {self.video_clip_root}")
@@ -292,6 +413,18 @@ class AudioScoreService:
             raise RuntimeError(f"Configuration missing keys: {', '.join(sorted(missing))}")
         return config
 
+    def _flush_cache_root(self, cache_path: Path) -> None:
+        """Remove cache directory before rebuilding cached references."""
+        if cache_path.exists():
+            try:
+                cache_path.relative_to(self.app_root)
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"Refusing to delete cache directory outside application root: {cache_path}"
+                ) from exc
+            LOGGER.info("Clearing cache directory: %s", cache_path)
+            shutil.rmtree(cache_path)
+
     def _parse_model_specs(self, config: Dict[str, Any]) -> Dict[str, ModelSpec]:
         model_entries = config.get("models")
         if not model_entries:
@@ -318,14 +451,17 @@ class AudioScoreService:
                 processor_id=entry.get("processor_id"),
                 transcriber_id=entry.get("transcriber_id"),
                 sampling_rate=entry.get("sampling_rate"),
+                style_model_id=entry.get("style_model_id"),
             )
             specs[spec.key] = spec
         return specs
 
     def _create_runner(self, spec: ModelSpec) -> BaseModelRunner:
-        if spec.type == "whisper":
+        if spec.type.startswith("whisper-style"):
+            return WhisperStyleModelRunner(spec, self.device)
+        if spec.type.startswith("whisper"):
             return WhisperModelRunner(spec, self.device)
-        if spec.type == "higgs_audio":
+        if spec.type.startswith("higgs-audio"):
             return HiggsAudioRunner(spec, self.device)
         raise RuntimeError(f"Unsupported model type '{spec.type}' for model '{spec.key}'.")
 
@@ -444,8 +580,11 @@ class AudioScoreService:
         }
 
     def _audio_similarity(self, reference_hidden: torch.Tensor, query_hidden: torch.Tensor) -> float:
-        ref_vec = reference_hidden.mean(dim=0)
-        qry_vec = query_hidden.mean(dim=0)
+        ref_vec = self._prepare_audio_vector(reference_hidden)
+        qry_vec = self._prepare_audio_vector(query_hidden)
+
+        if ref_vec.shape[0] != qry_vec.shape[0]:
+            ref_vec, qry_vec = self._match_vector_dimensions(ref_vec, qry_vec)
 
         ref_norm = ref_vec / (ref_vec.norm(p=2) + 1e-8)
         qry_norm = qry_vec / (qry_vec.norm(p=2) + 1e-8)
@@ -459,6 +598,28 @@ class AudioScoreService:
         query_clean = query_transcript.lower().strip()
         matcher = SequenceMatcher(None, reference_clean, query_clean)
         return float(matcher.ratio())
+
+    @staticmethod
+    def _prepare_audio_vector(hidden: torch.Tensor) -> torch.Tensor:
+        if hidden.dim() == 1:
+            return hidden.float()
+        if hidden.dim() == 2:
+            return hidden.mean(dim=0).float()
+        raise ValueError("hidden tensor must be either 1D or 2D.")
+
+    @staticmethod
+    def _match_vector_dimensions(ref_vec: torch.Tensor, qry_vec: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        target_dim = max(ref_vec.shape[0], qry_vec.shape[0])
+
+        def _resize(vec: torch.Tensor, target: int) -> torch.Tensor:
+            if vec.shape[0] == target:
+                return vec
+            source = vec.unsqueeze(0).unsqueeze(0)  # shape [1, 1, dim]
+            mode = "linear" if vec.shape[0] > 1 else "nearest"
+            resized = F.interpolate(source, size=target, mode=mode, align_corners=False)
+            return resized.squeeze(0).squeeze(0)
+
+        return _resize(ref_vec, target_dim), _resize(qry_vec, target_dim)
 
 
 service = AudioScoreService()
