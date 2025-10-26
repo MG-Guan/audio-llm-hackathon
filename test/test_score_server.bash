@@ -12,7 +12,10 @@ fi
 
 printf "Sending request to score server with moddel_type=%s uid=%s, cid=%s, file_path=%s\n" "$model_type" "$uid" "$cid" "$file_path"
 
-curl -X POST http://127.0.0.1:9000/score \
+host="http://127.0.0.1:9000"
+host="https://revocable-glossingly-anissa.ngrok-free.dev"
+
+curl -X POST ${host}/score \
   -F "uid=${uid}" \
   -F "cid=${cid}" \
   -F "model=${model_type}" \
