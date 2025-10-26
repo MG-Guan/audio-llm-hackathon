@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 import json
 import logging
+import os
+import re
 import shutil
+import wave
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -22,9 +26,9 @@ from transformers import AutoFeatureExtractor, AutoModel, AutoProcessor, Whisper
 from torchaudio.functional import resample as ta_resample
 
 try:
-    from boson_multimodal.model.higgs_audio import HiggsAudioModel
+    import openai
 except ImportError:  # pragma: no cover - optional dependency during development
-    HiggsAudioModel = None
+    openai = None
 
 
 LOGGER = logging.getLogger("audio_score_server")
@@ -38,6 +42,7 @@ class ClipReference:
     transcript: str
     transcript_path: Path
     hidden_path: Path
+    audio_path: Path
 
 
 @dataclass
@@ -49,6 +54,12 @@ class ModelSpec:
     transcriber_id: str | None = None
     sampling_rate: int | None = None
     style_model_id: str | None = None
+    api_base: str | None = None
+    api_key_env: str | None = None
+    system_prompt: str | None = None
+    user_prompt: str | None = None
+    temperature: float | None = None
+    max_completion_tokens: int | None = None
 
 
 class BaseModelRunner:
@@ -219,92 +230,189 @@ class WhisperStyleModelRunner(BaseModelRunner):
         return F.normalize(style_vec.squeeze(0), p=2, dim=-1).float().cpu()
 
 
-class HiggsAudioRunner(BaseModelRunner):
-    """Run inference using the Higgs-Audio audio tower with a configurable transcript model."""
+class HiggsAudioUnderstandingRunner(BaseModelRunner):
+    """Runner that proxies similarity scoring to the Higgs Audio Understanding API."""
+
+    DEFAULT_MODEL = "higgs-audio-understanding-Hackathon"
+    DEFAULT_BASE_URL = "https://hackathon.boson.ai/v1"
+    DEFAULT_SYSTEM_PROMPT = (
+        "You are a helpful assistant. I will provide you with an audio file, "
+        "Answer my questions about the audio."
+    )
+    DEFAULT_USER_PROMPT = (
+        "How many different speakers are in the audio? "
+    )
+    TRANSFER_FORMAT = "wav"
 
     def __init__(self, spec: ModelSpec, device: torch.device):
-        if HiggsAudioModel is None:
-            raise RuntimeError("boson_multimodal package is required for Higgs-Audio models.")
-        if spec.processor_id is None:
-            raise ValueError("processor_id must be provided for Higgs-Audio models.")
-        if spec.transcriber_id is None:
-            raise ValueError("transcriber_id must be provided for Higgs-Audio models.")
-
         super().__init__(spec, device)
-
-        processor_kwargs: Dict[str, Any] = {"trust_remote_code": True}
-        self.processor = AutoProcessor.from_pretrained(spec.processor_id, **processor_kwargs)
-        self.processor_rate = self.processor.feature_extractor.sampling_rate
-
-        model_kwargs: Dict[str, Any] = {
-            "trust_remote_code": True,
-            "device_map": {"": "cpu"},
-        }
-        if device.type == "cuda":
-            model_kwargs["torch_dtype"] = torch.float16
-        else:
-            model_kwargs["torch_dtype"] = torch.float32
-        base_model = HiggsAudioModel.from_pretrained(spec.model_id, **model_kwargs)
-
-        audio_tower = getattr(base_model, "audio_tower", None)
-        if audio_tower is None:
-            raise RuntimeError("Configured Higgs-Audio checkpoint does not contain an audio tower.")
-
-        self.audio_tower = audio_tower.to(self.device)
-        self.audio_tower.eval()
-        self.audio_dtype = self.audio_tower.conv1.weight.dtype
-
-        transcriber_kwargs: Dict[str, Any] = {}
-        if device.type == "cuda":
-            transcriber_kwargs["torch_dtype"] = torch.float16
-        self.transcriber_processor = WhisperProcessor.from_pretrained(spec.transcriber_id)
-        self.transcriber_rate = self.transcriber_processor.feature_extractor.sampling_rate
-        self.transcriber_model = WhisperForConditionalGeneration.from_pretrained(
-            spec.transcriber_id,
-            **transcriber_kwargs,
-        )
-        self.transcriber_model.to(self.device)
-        self.transcriber_model.eval()
-        self.transcriber_dtype = self.transcriber_model.model.encoder.conv1.weight.dtype
-
-    def transcribe_and_embed(self, waveform: np.ndarray, sampling_rate: int) -> Tuple[str, torch.Tensor]:
-        transcript_audio, transcript_sr = self._resample_if_needed(waveform, sampling_rate, self.transcriber_rate)
-        transcript_features = self.transcriber_processor(
-            transcript_audio,
-            sampling_rate=transcript_sr,
-            return_tensors="pt",
-        )
-        transcript_inputs = transcript_features.input_features.to(self.device, dtype=self.transcriber_dtype)
-
-        with torch.no_grad():
-            generated_ids = self.transcriber_model.generate(input_features=transcript_inputs)
-        transcript = self.transcriber_processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
-
-        embed_audio, embed_sr = self._resample_if_needed(waveform, sampling_rate, self.processor_rate)
-        embed_features = self.processor(
-            embed_audio,
-            sampling_rate=embed_sr,
-            return_tensors="pt",
-            padding="max_length",
-        )
-        input_features = embed_features.input_features.to(self.device, dtype=self.audio_dtype)
-        attention_mask = getattr(embed_features, "attention_mask", None)
-        if attention_mask is not None:
-            attention_mask = attention_mask.to(self.device)
-
-        with torch.no_grad():
-            outputs = self.audio_tower(
-                input_features,
-                attention_mask=attention_mask,
-                check_seq_length=False,
-                return_dict=True,
+        if openai is None:
+            raise RuntimeError(
+                "The 'openai' package is required for the Higgs Audio Understanding runner."
             )
-        pooled_hidden = self._pool_hidden_state(
-            outputs.last_hidden_state.squeeze(0),
-            attention_mask,
+        self.model_id = spec.model_id or self.DEFAULT_MODEL
+        self.api_base = spec.api_base or self.DEFAULT_BASE_URL
+        self.api_key_env = spec.api_key_env or "BOSON_API_KEY"
+        api_key = os.getenv(self.api_key_env)
+        if not api_key:
+            raise RuntimeError(
+                f"Environment variable '{self.api_key_env}' must be set for model '{self.model_id}'."
+            )
+        self.client = openai.Client(api_key=api_key, base_url=self.api_base)
+        self.temperature = spec.temperature if spec.temperature is not None else 1.0
+        self.max_tokens = spec.max_completion_tokens or 256
+        self.system_prompt = spec.system_prompt or self.DEFAULT_SYSTEM_PROMPT
+        self.user_prompt = spec.user_prompt or self.DEFAULT_USER_PROMPT
+
+    def prepare_reference(
+        self,
+        video_id: str,
+        clip_id: str,
+        clip_path: Path,
+        transcript_path: Path,
+        hidden_path: Path,
+    ) -> ClipReference:
+        """Store minimal metadata for remote similarity comparisons."""
+        return ClipReference(
+            self.key,
+            video_id,
+            clip_id,
+            "",
+            transcript_path,
+            hidden_path,
+            clip_path,
         )
-        hidden_state = pooled_hidden.float().cpu()
-        return transcript, hidden_state
+
+    async def score_similarity(
+        self,
+        service: "AudioScoreService",
+        model_key: str,
+        video_id: str,
+        clip_id: str,
+        query_waveform: np.ndarray,
+        query_sampling_rate: int,
+    ) -> Dict[str, float]:
+        reference = service.get_reference(model_key, video_id, clip_id)
+        try:
+            ref_waveform, ref_sr = service._load_audio_file(reference.audio_path)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=500, detail=f"Failed to load reference audio: {exc}") from exc
+
+        ref_b64 = service.waveform_to_base64(ref_waveform, ref_sr)
+        qry_b64 = service.waveform_to_base64(query_waveform, query_sampling_rate)
+        concatenated_audio = ref_b64 + qry_b64
+
+        def _call_remote() -> Dict[str, float]:
+            return self._invoke_remote_similarity(concatenated_audio)
+
+        try:
+            return await asyncio.to_thread(_call_remote)
+        except HTTPException:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=502, detail=f"Higgs audio understanding request failed: {exc}") from exc
+
+    def _invoke_remote_similarity(self, concatenated_audio_b64: str) -> Dict[str, float]:
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model_id,
+                messages=[
+                    {"role": "system", "content": self.system_prompt},
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_audio",
+                                "input_audio": {
+                                    "data": concatenated_audio_b64,
+                                    "format": self.TRANSFER_FORMAT,
+                                },
+                            },
+                        ],
+                    },
+                    {"role": "user", "content": self.user_prompt},
+                ],
+                temperature=self.temperature,
+                max_completion_tokens=self.max_tokens,
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=502, detail=f"Failed to reach Higgs audio understanding: {exc}") from exc
+
+        return self._parse_similarity_response(response)
+
+    def _parse_similarity_response(self, response: Any) -> Dict[str, float]:
+        try:
+            content = response.choices[0].message.content
+        except (AttributeError, IndexError, KeyError) as exc:  # noqa: BLE001
+            raise HTTPException(status_code=502, detail="Malformed response from Higgs audio understanding.") from exc
+
+        text = self._coerce_content_to_text(content).strip()
+        json_payload = self._extract_json_block(text)
+        try:
+            payload = json.loads(json_payload)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Unable to parse similarity response: {text}",
+            ) from exc
+
+        def _extract_score(key: str) -> float | None:
+            if key not in payload:
+                return None
+            try:
+                value = float(payload[key])
+            except (TypeError, ValueError) as exc:  # noqa: BLE001
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Invalid value returned for '{key}': {payload[key]!r}",
+                ) from exc
+            return max(0.0, min(1.0, value))
+
+        sim_score = _extract_score("sim_score")
+        audio_sim = _extract_score("audio_sim_score")
+        text_sim = _extract_score("text_sim_score")
+
+        if audio_sim is None and text_sim is None and sim_score is None:
+            raise HTTPException(
+                status_code=502,
+                detail="No similarity scores returned by Higgs audio understanding endpoint.",
+            )
+
+        if sim_score is None and audio_sim is not None and text_sim is not None:
+            sim_score = float((audio_sim + text_sim) / 2.0)
+
+        sim_score = sim_score if sim_score is not None else audio_sim or text_sim or 0.0
+        audio_sim = audio_sim if audio_sim is not None else sim_score
+        text_sim = text_sim if text_sim is not None else sim_score
+
+        return {
+            "sim_score": sim_score,
+            "audio_sim_score": audio_sim,
+            "text_sim_score": text_sim,
+        }
+
+    @staticmethod
+    def _coerce_content_to_text(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                text = getattr(item, "text", None)
+                if text is None and isinstance(item, dict):
+                    text = item.get("text")
+                if text is None:
+                    text = str(item)
+                parts.append(text)
+            return "".join(parts)
+        return str(content)
+
+    @staticmethod
+    def _extract_json_block(text: str) -> str:
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if match:
+            return match.group(0)
+        return text
 
 
 class AudioScoreService:
@@ -452,6 +560,12 @@ class AudioScoreService:
                 transcriber_id=entry.get("transcriber_id"),
                 sampling_rate=entry.get("sampling_rate"),
                 style_model_id=entry.get("style_model_id"),
+                api_base=entry.get("api_base"),
+                api_key_env=entry.get("api_key_env"),
+                system_prompt=entry.get("system_prompt"),
+                user_prompt=entry.get("user_prompt"),
+                temperature=entry.get("temperature"),
+                max_completion_tokens=entry.get("max_completion_tokens"),
             )
             specs[spec.key] = spec
         return specs
@@ -461,8 +575,8 @@ class AudioScoreService:
             return WhisperStyleModelRunner(spec, self.device)
         if spec.type.startswith("whisper"):
             return WhisperModelRunner(spec, self.device)
-        if spec.type.startswith("higgs-audio"):
-            return HiggsAudioRunner(spec, self.device)
+        if spec.type.startswith("higgs-endpoint"):
+            return HiggsAudioUnderstandingRunner(spec, self.device)
         raise RuntimeError(f"Unsupported model type '{spec.type}' for model '{spec.key}'.")
 
     def _iter_clip_files(self) -> Iterable[Path]:
@@ -494,10 +608,21 @@ class AudioScoreService:
         transcript_path = clip_cache_dir / "transcript.txt"
         hidden_path = clip_cache_dir / "hidden.pt"
 
+        if isinstance(runner, HiggsAudioUnderstandingRunner):
+            return runner.prepare_reference(video_id, clip_id, clip_path, transcript_path, hidden_path)
+
         if transcript_path.exists() and hidden_path.exists():
             transcript = transcript_path.read_text(encoding="utf-8").strip()
             if transcript:
-                return ClipReference(model_key, video_id, clip_id, transcript, transcript_path, hidden_path)
+                return ClipReference(
+                    model_key,
+                    video_id,
+                    clip_id,
+                    transcript,
+                    transcript_path,
+                    hidden_path,
+                    clip_path,
+                )
 
         waveform, sampling_rate = self._load_audio_file(clip_path)
         transcript, hidden = runner.transcribe_and_embed(waveform, sampling_rate)
@@ -505,7 +630,15 @@ class AudioScoreService:
         transcript_path.write_text(transcript, encoding="utf-8")
         torch.save(hidden, hidden_path)
 
-        return ClipReference(model_key, video_id, clip_id, transcript, transcript_path, hidden_path)
+        return ClipReference(
+            model_key,
+            video_id,
+            clip_id,
+            transcript,
+            transcript_path,
+            hidden_path,
+            clip_path,
+        )
 
     def _load_audio_file(self, path: Path) -> Tuple[np.ndarray, int]:
         with path.open("rb") as stream:
@@ -536,6 +669,24 @@ class AudioScoreService:
 
         return samples.astype(np.float32), sampling_rate
 
+    @staticmethod
+    def _waveform_to_wav_bytes(waveform: np.ndarray, sampling_rate: int) -> bytes:
+        """Serialize a mono waveform into 16-bit PCM WAV bytes."""
+        clipped = np.clip(waveform, -1.0, 1.0)
+        pcm = (clipped * np.iinfo(np.int16).max).astype(np.int16)
+        buffer = io.BytesIO()
+        with wave.open(buffer, "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(int(sampling_rate))
+            handle.writeframes(pcm.tobytes())
+        return buffer.getvalue()
+
+    @staticmethod
+    def waveform_to_base64(waveform: np.ndarray, sampling_rate: int) -> str:
+        wav_bytes = AudioScoreService._waveform_to_wav_bytes(waveform, sampling_rate)
+        return base64.b64encode(wav_bytes).decode("utf-8")
+
     async def process_uploaded_audio(self, file: UploadFile) -> Tuple[np.ndarray, int]:
         payload = await file.read()
         if not payload:
@@ -548,6 +699,16 @@ class AudioScoreService:
             await file.close()
         return waveform, sampling_rate
 
+    def get_reference(self, model_key: str, video_id: str, clip_id: str) -> ClipReference:
+        reference_map = self.references.get(model_key)
+        if reference_map is None:
+            raise HTTPException(status_code=404, detail=f"Unknown model '{model_key}'.")
+
+        reference = reference_map.get((video_id, clip_id))
+        if reference is None:
+            raise HTTPException(status_code=404, detail="Reference clip not found.")
+        return reference
+
     def score(
         self,
         model_key: str,
@@ -556,13 +717,7 @@ class AudioScoreService:
         query_transcript: str,
         query_hidden: torch.Tensor,
     ) -> Dict[str, float]:
-        reference_map = self.references.get(model_key)
-        if reference_map is None:
-            raise HTTPException(status_code=404, detail=f"Unknown model '{model_key}'.")
-
-        reference = reference_map.get((video_id, clip_id))
-        if reference is None:
-            raise HTTPException(status_code=404, detail="Reference clip not found.")
+        reference = self.get_reference(model_key, video_id, clip_id)
 
         try:
             reference_hidden = torch.load(reference.hidden_path, map_location="cpu")
@@ -657,13 +812,22 @@ async def score_endpoint(
         raise HTTPException(status_code=400, detail=f"Unknown model '{model_key}'.")
 
     waveform, sampling_rate = await service.process_uploaded_audio(audio)
-    query_transcript, query_hidden = await asyncio.to_thread(
-        runner.transcribe_and_embed,
-        waveform,
-        sampling_rate,
-    )
-
-    result = service.score(model_key, video_id, clip_id, query_transcript, query_hidden)
+    if isinstance(runner, HiggsAudioUnderstandingRunner):
+        result = await runner.score_similarity(
+            service=service,
+            model_key=model_key,
+            video_id=video_id,
+            clip_id=clip_id,
+            query_waveform=waveform,
+            query_sampling_rate=sampling_rate,
+        )
+    else:
+        query_transcript, query_hidden = await asyncio.to_thread(
+            runner.transcribe_and_embed,
+            waveform,
+            sampling_rate,
+        )
+        result = service.score(model_key, video_id, clip_id, query_transcript, query_hidden)
     payload = {"model": model_key, **result}
     return JSONResponse(payload)
 
