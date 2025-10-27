@@ -14,7 +14,7 @@ import wave
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any, Dict, Iterable, Tuple
+from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -65,6 +65,8 @@ class ModelSpec:
 class BaseModelRunner:
     """Common interface for model-specific inference logic."""
 
+    supports_batching: bool = False
+
     def __init__(self, spec: ModelSpec, device: torch.device):
         self.spec = spec
         self.device = device
@@ -82,6 +84,19 @@ class BaseModelRunner:
 
     def transcribe_and_embed(self, waveform: np.ndarray, sampling_rate: int) -> Tuple[str, torch.Tensor]:
         raise NotImplementedError
+
+    def transcribe_and_embed_batch(
+        self,
+        waveforms: Sequence[np.ndarray],
+        sampling_rates: Sequence[int],
+    ) -> List[Tuple[str, torch.Tensor]]:
+        """Fallback batching logic executes requests sequentially."""
+        if len(waveforms) != len(sampling_rates):
+            raise ValueError("waveforms and sampling_rates must have the same length.")
+        return [
+            self.transcribe_and_embed(waveform, sampling_rate)
+            for waveform, sampling_rate in zip(waveforms, sampling_rates)
+        ]
 
     @staticmethod
     def _pool_hidden_state(hidden_state: torch.Tensor, attention_mask: torch.Tensor | None) -> torch.Tensor:
@@ -106,51 +121,13 @@ class BaseModelRunner:
         return F.normalize(pooled, p=2, dim=0)
 
 
-class WhisperModelRunner(BaseModelRunner):
-    """Run inference using a Whisper checkpoint."""
-
-    def __init__(self, spec: ModelSpec, device: torch.device):
-        super().__init__(spec, device)
-        self.model_id = spec.model_id
-        self.processor = WhisperProcessor.from_pretrained(self.model_id)
-        model_kwargs: Dict[str, Any] = {}
-        if device.type == "cuda":
-            model_kwargs["torch_dtype"] = torch.float16
-        self.model = WhisperForConditionalGeneration.from_pretrained(self.model_id, **model_kwargs)
-        self.model.to(self.device)
-        self.model.eval()
-        self.feature_rate = self.processor.feature_extractor.sampling_rate
-        self.model_dtype = self.model.model.encoder.conv1.weight.dtype
-
-    def transcribe_and_embed(self, waveform: np.ndarray, sampling_rate: int) -> Tuple[str, torch.Tensor]:
-        audio, audio_sr = self._resample_if_needed(waveform, sampling_rate, self.feature_rate)
-
-        features = self.processor(
-            audio,
-            sampling_rate=audio_sr,
-            return_tensors="pt",
-        )
-        attention_mask = getattr(features, "attention_mask", None)
-        input_features = features.input_features.to(self.device, dtype=self.model_dtype)
-
-        with torch.no_grad():
-            encoder_outputs = self.model.model.encoder(input_features=input_features)
-            pooled_hidden = self._pool_hidden_state(
-                encoder_outputs.last_hidden_state.squeeze(0),
-                attention_mask,
-            )
-            hidden_state = pooled_hidden.float().cpu()
-            generated_ids = self.model.generate(input_features=input_features)
-
-        transcript = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
-        return transcript, hidden_state
-
-
 class WhisperStyleModelRunner(BaseModelRunner):
     """Whisper for ASR paired with a Hugging Face speaker/prosody embedding model."""
 
     DEFAULT_STYLE_MODEL = "microsoft/wavlm-base-plus-sv"
 
+    supports_batching = True
+
     def __init__(self, spec: ModelSpec, device: torch.device):
         super().__init__(spec, device)
         self.model_id = spec.model_id
@@ -163,6 +140,8 @@ class WhisperStyleModelRunner(BaseModelRunner):
         self.model.eval()
         self.feature_rate = self.processor.feature_extractor.sampling_rate
         self.model_dtype = self.model.model.encoder.conv1.weight.dtype
+        self.feature_padding_value = float(getattr(self.processor.feature_extractor, "padding_value", 0.0))
+        self.expected_mel_length = self._determine_expected_mel_length()
 
         requested_style_model = spec.style_model_id or self.DEFAULT_STYLE_MODEL
         self.style_sample_rate = spec.sampling_rate or self.feature_rate
@@ -190,8 +169,11 @@ class WhisperStyleModelRunner(BaseModelRunner):
             audio,
             sampling_rate=audio_sr,
             return_tensors="pt",
+            padding="longest",
+            return_attention_mask=True,
         )
         input_features = features.input_features.to(self.device, dtype=self.model_dtype)
+        input_features = self._pad_mel_features(input_features)
 
         with torch.no_grad():
             generated_ids = self.model.generate(input_features=input_features)
@@ -202,6 +184,45 @@ class WhisperStyleModelRunner(BaseModelRunner):
         hidden_state = self._encode_style_with_hf(style_audio)
         return transcript, hidden_state
 
+    def transcribe_and_embed_batch(
+        self,
+        waveforms: Sequence[np.ndarray],
+        sampling_rates: Sequence[int],
+    ) -> List[Tuple[str, torch.Tensor]]:
+        if len(waveforms) != len(sampling_rates):
+            raise ValueError("waveforms and sampling_rates must have the same length.")
+
+        asr_audio: List[np.ndarray] = []
+        style_audio_inputs: List[np.ndarray] = []
+
+        for waveform, sampling_rate in zip(waveforms, sampling_rates):
+            whisper_audio, _ = self._resample_if_needed(waveform, sampling_rate, self.feature_rate)
+            style_audio, _ = self._resample_if_needed(waveform, sampling_rate, self.style_sample_rate)
+            asr_audio.append(whisper_audio)
+            style_audio_inputs.append(style_audio)
+
+        features = self.processor(
+            asr_audio,
+            sampling_rate=self.feature_rate,
+            return_tensors="pt",
+            padding="longest",
+            return_attention_mask=True,
+        )
+        input_features = features.input_features.to(self.device, dtype=self.model_dtype)
+        input_features = self._pad_mel_features(input_features)
+
+        with torch.no_grad():
+            generated_ids = self.model.generate(input_features=input_features)
+
+        transcripts = self.processor.batch_decode(generated_ids, skip_special_tokens=True)
+        style_embeddings = self._encode_style_batch(style_audio_inputs)
+
+        results: List[Tuple[str, torch.Tensor]] = []
+        for transcript, hidden_state in zip(transcripts, style_embeddings):
+            results.append((transcript.strip(), hidden_state))
+
+        return results
+
     @staticmethod
     def _load_hf_processor(model_id: str):
         try:
@@ -210,12 +231,22 @@ class WhisperStyleModelRunner(BaseModelRunner):
             return AutoFeatureExtractor.from_pretrained(model_id)
 
     def _encode_style_with_hf(self, audio: np.ndarray) -> torch.Tensor:
+        embeddings = self._encode_style_batch([audio])
+        if not embeddings:
+            raise RuntimeError("Failed to compute style embedding.")
+        return embeddings[0]
+
+    def _encode_style_batch(self, audios: Sequence[np.ndarray]) -> List[torch.Tensor]:
         if self.style_processor is None or self.style_model is None:
             raise RuntimeError("Hugging Face style model not initialized.")
+        if not audios:
+            return []
+
         inputs = self.style_processor(
-            audio,
+            list(audios),
             sampling_rate=self.style_sample_rate,
             return_tensors="pt",
+            padding=True,
         )
         input_values = inputs.get("input_values")
         if input_values is None:
@@ -223,11 +254,41 @@ class WhisperStyleModelRunner(BaseModelRunner):
         input_values = input_values.to(self.device, dtype=self.style_dtype)
         with torch.no_grad():
             outputs = self.style_model(input_values)
+
         if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
             style_vec = outputs.pooler_output
         else:
             style_vec = outputs.last_hidden_state.mean(dim=1)
-        return F.normalize(style_vec.squeeze(0), p=2, dim=-1).float().cpu()
+
+        normalized = F.normalize(style_vec, p=2, dim=-1).float().cpu()
+        return [normalized[idx] for idx in range(normalized.size(0))]
+
+    def _determine_expected_mel_length(self) -> int:
+        extractor = self.processor.feature_extractor
+        for attr in ("nb_max_frames", "max_length", "n_frames"):
+            value = getattr(extractor, attr, None)
+            if value:
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    continue
+        value = getattr(self.model.config, "max_source_positions", None)
+        if value:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                pass
+        return 3000
+
+    def _pad_mel_features(self, features: torch.Tensor) -> torch.Tensor:
+        target_len = max(self.expected_mel_length, 3000)
+        current_len = features.size(-1)
+        if current_len == target_len:
+            return features
+        if current_len > target_len:
+            return features[..., :target_len]
+        pad_amount = target_len - current_len
+        return F.pad(features, (0, pad_amount), value=self.feature_padding_value)
 
 
 class HiggsAudioUnderstandingRunner(BaseModelRunner):
@@ -433,6 +494,15 @@ class AudioScoreService:
         self.runners: Dict[str, BaseModelRunner] = {}
         self.references: Dict[str, Dict[Tuple[str, str], ClipReference]] = {}
         self.default_model_key: str | None = None
+        self.batchers: Dict[str, DynamicBatcher] = {}
+        self.batch_max_size = int(os.getenv("AUDIO_SCORE_MAX_BATCH_SIZE", "8"))
+        self.batch_max_wait_ms = float(os.getenv("AUDIO_SCORE_MAX_BATCH_WAIT_MS", "300"))
+        if self.batch_max_size < 1:
+            self.batch_max_size = 1
+        if self.batch_max_wait_ms < 0:
+            self.batch_max_wait_ms = 0.0
+        self.disable_cache_flush = self._env_flag("AUDIO_SCORE_DISABLE_CACHE_FLUSH")
+        self.requested_model_keys = self._load_requested_model_keys()
 
         self._startup_lock = asyncio.Lock()
         self._ready_event = asyncio.Event()
@@ -447,6 +517,7 @@ class AudioScoreService:
                 return
 
             await asyncio.to_thread(self._initialize_sync)
+            await self._initialize_batchers()
             self._ready_event.set()
 
     async def ensure_ready(self) -> None:
@@ -467,8 +538,18 @@ class AudioScoreService:
         if not self.video_clip_root.exists():
             raise RuntimeError(f"Video clip directory not found: {self.video_clip_root}")
 
-        self.model_specs = self._parse_model_specs(self.config)
+        model_specs = self._parse_model_specs(self.config)
+        if self.requested_model_keys:
+            missing = sorted(set(self.requested_model_keys) - set(model_specs))
+            if missing:
+                LOGGER.warning("Requested model keys not found in config: %s", ", ".join(missing))
+            model_specs = {key: spec for key, spec in model_specs.items() if key in self.requested_model_keys}
+        self.model_specs = model_specs
         if not self.model_specs:
+            if self.requested_model_keys:
+                raise RuntimeError(
+                    "No models available after applying AUDIO_SCORE_MODEL_KEY(S) filter."
+                )
             raise RuntimeError("No models specified in the configuration.")
         self.default_model_key = None
 
@@ -521,8 +602,68 @@ class AudioScoreService:
             raise RuntimeError(f"Configuration missing keys: {', '.join(sorted(missing))}")
         return config
 
+    @staticmethod
+    def _env_flag(name: str) -> bool:
+        value = os.getenv(name)
+        if value is None:
+            return False
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+
+    def _load_requested_model_keys(self) -> set[str] | None:
+        candidates = []
+        multi = os.getenv("AUDIO_SCORE_MODEL_KEYS")
+        single = os.getenv("AUDIO_SCORE_MODEL_KEY")
+        if multi:
+            candidates.append(multi)
+        if single:
+            candidates.append(single)
+
+        keys: set[str] = set()
+        for raw in candidates:
+            for segment in raw.split(","):
+                token = segment.strip()
+                if token:
+                    keys.add(token)
+        return keys or None
+
+    async def _initialize_batchers(self) -> None:
+        self.batchers.clear()
+        if self.batch_max_size <= 1:
+            return
+
+        enabled_models: list[str] = []
+        for key, runner in self.runners.items():
+            if not runner.supports_batching:
+                continue
+            batcher = DynamicBatcher(
+                runner=runner,
+                max_batch_size=self.batch_max_size,
+                max_wait_ms=self.batch_max_wait_ms,
+            )
+            await batcher.start()
+            self.batchers[key] = batcher
+            enabled_models.append(key)
+
+        if enabled_models:
+            LOGGER.info(
+                "Dynamic batching enabled for models: %s (max_batch_size=%d, max_wait_ms=%.2f)",
+                ", ".join(sorted(enabled_models)),
+                self.batch_max_size,
+                self.batch_max_wait_ms,
+            )
+
+    async def shutdown(self) -> None:
+        if not self.batchers:
+            return
+        tasks = [batcher.stop() for batcher in self.batchers.values()]
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self.batchers.clear()
+
     def _flush_cache_root(self, cache_path: Path) -> None:
         """Remove cache directory before rebuilding cached references."""
+        if self.disable_cache_flush:
+            LOGGER.info("Skipping cache clear for %s (AUDIO_SCORE_DISABLE_CACHE_FLUSH=1).", cache_path)
+            return
         if cache_path.exists():
             try:
                 cache_path.relative_to(self.app_root)
@@ -573,8 +714,6 @@ class AudioScoreService:
     def _create_runner(self, spec: ModelSpec) -> BaseModelRunner:
         if spec.type.startswith("whisper-style"):
             return WhisperStyleModelRunner(spec, self.device)
-        if spec.type.startswith("whisper"):
-            return WhisperModelRunner(spec, self.device)
         if spec.type.startswith("higgs-endpoint"):
             return HiggsAudioUnderstandingRunner(spec, self.device)
         raise RuntimeError(f"Unsupported model type '{spec.type}' for model '{spec.key}'.")
@@ -777,6 +916,118 @@ class AudioScoreService:
         return _resize(ref_vec, target_dim), _resize(qry_vec, target_dim)
 
 
+@dataclass
+class BatchRequest:
+    waveform: np.ndarray
+    sampling_rate: int
+    future: asyncio.Future
+
+
+class DynamicBatcher:
+    """Simple dynamic batcher that groups requests before invoking the runner."""
+
+    def __init__(
+        self,
+        runner: BaseModelRunner,
+        max_batch_size: int,
+        max_wait_ms: float,
+    ) -> None:
+        if max_batch_size < 1:
+            raise ValueError("max_batch_size must be at least 1.")
+
+        self.runner = runner
+        self.max_batch_size = max_batch_size
+        self.max_wait_seconds = max(0.0, max_wait_ms) / 1000.0
+
+        self._queue: asyncio.Queue[BatchRequest | None] = asyncio.Queue()
+        self._worker_task: asyncio.Task | None = None
+        self._closed = False
+
+    async def start(self) -> None:
+        if self._worker_task is None or self._worker_task.done():
+            self._worker_task = asyncio.create_task(self._run())
+
+    async def stop(self) -> None:
+        self._closed = True
+        if self._worker_task is not None and not self._worker_task.done():
+            await self._queue.put(None)
+            await self._worker_task
+        # Drain remaining queued items and notify callers.
+        try:
+            while True:
+                request = self._queue.get_nowait()
+                if request is None:
+                    continue
+                if not request.future.done():
+                    request.future.set_exception(RuntimeError("Batcher stopped."))
+        except asyncio.QueueEmpty:
+            pass
+
+    async def enqueue(self, waveform: np.ndarray, sampling_rate: int) -> Tuple[str, torch.Tensor]:
+        if self._closed:
+            raise RuntimeError("Cannot enqueue request on a stopped batcher.")
+
+        await self.start()
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future = loop.create_future()
+        request = BatchRequest(waveform=waveform, sampling_rate=sampling_rate, future=future)
+        await self._queue.put(request)
+        return await future
+
+    async def _run(self) -> None:
+        loop = asyncio.get_running_loop()
+        while True:
+            request = await self._queue.get()
+            if request is None:
+                break
+
+            batch = [request]
+            deadline = loop.time() + self.max_wait_seconds
+
+            while len(batch) < self.max_batch_size:
+                timeout = deadline - loop.time()
+                if timeout <= 0:
+                    break
+                try:
+                    next_request = await asyncio.wait_for(self._queue.get(), timeout)
+                except asyncio.TimeoutError:
+                    break
+
+                if next_request is None:
+                    await self._queue.put(None)
+                    break
+                batch.append(next_request)
+
+            await self._process_batch(batch)
+
+    async def _process_batch(self, batch: List[BatchRequest]) -> None:
+        waveforms = [item.waveform for item in batch]
+        sampling_rates = [item.sampling_rate for item in batch]
+
+        try:
+            results = await asyncio.to_thread(
+                self.runner.transcribe_and_embed_batch,
+                waveforms,
+                sampling_rates,
+            )
+        except Exception as exc:  # noqa: BLE001
+            for item in batch:
+                if not item.future.done():
+                    item.future.set_exception(exc)
+            return
+
+        if len(results) != len(batch):
+            error = RuntimeError("Batch result count does not match request count.")
+            for item in batch:
+                if not item.future.done():
+                    item.future.set_exception(error)
+            return
+
+        for item, result in zip(batch, results):
+            if not item.future.done():
+                item.future.set_result(result)
+
+
 service = AudioScoreService()
 app = FastAPI()
 
@@ -784,6 +1035,11 @@ app = FastAPI()
 @app.on_event("startup")
 async def handle_startup() -> None:
     await service.startup()
+
+
+@app.on_event("shutdown")
+async def handle_shutdown() -> None:
+    await service.shutdown()
 
 
 @app.post("/score")
@@ -812,6 +1068,7 @@ async def score_endpoint(
         raise HTTPException(status_code=400, detail=f"Unknown model '{model_key}'.")
 
     waveform, sampling_rate = await service.process_uploaded_audio(audio)
+    batcher = service.batchers.get(model_key)
     if isinstance(runner, HiggsAudioUnderstandingRunner):
         result = await runner.score_similarity(
             service=service,
@@ -822,11 +1079,14 @@ async def score_endpoint(
             query_sampling_rate=sampling_rate,
         )
     else:
-        query_transcript, query_hidden = await asyncio.to_thread(
-            runner.transcribe_and_embed,
-            waveform,
-            sampling_rate,
-        )
+        if batcher is not None:
+            query_transcript, query_hidden = await batcher.enqueue(waveform, sampling_rate)
+        else:
+            query_transcript, query_hidden = await asyncio.to_thread(
+                runner.transcribe_and_embed,
+                waveform,
+                sampling_rate,
+            )
         result = service.score(model_key, video_id, clip_id, query_transcript, query_hidden)
     payload = {"model": model_key, **result}
     return JSONResponse(payload)
@@ -835,9 +1095,23 @@ async def score_endpoint(
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=9000,
-        reload=False,
-    )
+    socket_path = os.getenv("AUDIO_SCORE_SERVER_SOCKET")
+    if socket_path:
+        uds_path = Path(socket_path).resolve()
+        uds_path.parent.mkdir(parents=True, exist_ok=True)
+        if uds_path.exists():
+            uds_path.unlink()
+        uvicorn.run(
+            "main:app",
+            uds=str(uds_path),
+            reload=False,
+        )
+    else:
+        host = os.getenv("AUDIO_SCORE_SERVER_HOST", "0.0.0.0")
+        port = int(os.getenv("AUDIO_SCORE_SERVER_PORT", "9000"))
+        uvicorn.run(
+            "main:app",
+            host=host,
+            port=port,
+            reload=False,
+        )

@@ -45,16 +45,37 @@ If any model fails to load, the server logs the error and continues with the rem
 
 ## Run the server
 
+Single worker (binds to TCP by default; respects `AUDIO_SCORE_SERVER_*` env vars):
+
 ```bash
-python main.py
-# or
-uvicorn main:app --host 0.0.0.0 --port 9000
+python run_server.py --host 0.0.0.0 --port 9000
 ```
 
-Startup phases:
+For production you can launch multiple workers behind a local Nginx gateway:
+
+```bash
+python run_server_with_gate.py --workers 2 --listen-port 9000
+```
+
+`run_server_with_gate.py` starts the requested number of Unix-socket workers and generates a temp Nginx config that writes logs to `logs/` and stores request bodies under `logs/client_body_temp/` (avoids `/var/lib/nginx` permission errors). Stop the script with `Ctrl+C` to shut down Nginx and all workers.
+
+Startup phases for each worker:
 1. Load every configured model onto the available device (CUDA if present, else CPU).
 2. Walk `video_clip_dir` and produce transcripts + encoder tensors for each `.mov`, caching the results under `cache/<model>/<video>/<clip>/`.
-3. Begin serving requests on the chosen port (default `9000`).
+3. Begin serving requests either on the requested TCP port or Unix domain socket.
+
+If all workers share a single GPU they still serialize on that device; add more GPUs or lower model cost to increase throughput.
+
+### Environment variables
+
+Key knobs exposed by the service:
+
+- `AUDIO_SCORE_MODEL_KEYS` / `AUDIO_SCORE_MODEL_KEY`: limit which models load from `config.json` (comma separated).
+- `AUDIO_SCORE_MAX_BATCH_SIZE` (default `8`): maximum requests combined in the dynamic batcher.
+- `AUDIO_SCORE_MAX_BATCH_WAIT_MS` (default `10`): longest wait to fill a batch before dispatch.
+- `AUDIO_SCORE_DISABLE_CACHE_FLUSH=1`: preserve the existing cache directory on startup (useful when multiple workers share it).
+- `AUDIO_SCORE_SERVER_SOCKET`: when set, workers bind to the specified Unix domain socket; `run_server_with_gate.py` handles this automatically.
+- `AUDIO_SCORE_SERVER_HOST` / `AUDIO_SCORE_SERVER_PORT`: override TCP binding when not using sockets.
 
 ## Scoring API
 

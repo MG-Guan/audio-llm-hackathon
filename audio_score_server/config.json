@@ -1,26 +1,10 @@
 {
   "models": [
     {
-      "key": "whisper-medium",
-      "type": "whisper",
-      "model_id": "openai/whisper-medium"
-    },
-    {
       "key": "whisper-medium_wavlm-large",
       "type": "whisper-style",
       "model_id": "openai/whisper-medium",
       "style_model_id": "microsoft/wavlm-large"
-    },
-    {
-      "key": "higgs-audio-understanding",
-      "type": "higgs-endpoint",
-      "model_id": "higgs-audio-understanding-Hackathon",
-      "api_base": "https://hackathon.boson.ai/v1",
-      "api_key_env": "BOSON_API_KEY",
-      "system_prompt": "You are a helpful assistant. I will provide you with an audio file, it was concatenated from two recordings. Answer my questions about the audio.",
-      "user_prompt": "Return the audio similarities of the two recordings. Measure the similarity between two audio clips based on semantic accuracy, rhythm and pauses, emotion, and expressive impact. Return in json format: { \"audio_sim_score\": audio_sim, \"text_sim_score\": text_sim, \"sim_score\": average of audio_sim_score and text_sim_score}, all from 0.0 to 1.0 where 1.0 means identical audios.",
-      "temperature": 0.0,
-      "max_completion_tokens": 256
     }
   ],
   "video_clip_dir": "../video_clip",
