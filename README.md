@@ -29,7 +29,7 @@ This workspace contains the tooling used in the Boson AI 2025 Higgs Audio Hackat
 
 ```bash
 cd hackathon
-pip install -r ../requirements.txt
+pip install -r requirements.txt
 # ensure ffmpeg is installed for audio extraction
 ```
 
