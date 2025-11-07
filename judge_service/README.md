@@ -1,15 +1,17 @@
-# Higgs Audio Hackathon Toolkit
+# Higgs Audio Hackathon Judge Service
 
-This workspace contains the tooling used in the Boson AI 2025 Higgs Audio Hackathon. It bundles utilities for preparing media clips, recording user submissions, generating automatic transcripts, and serving similarity scores against curated references.
+This workspace contains the judge service and tooling used in the Boson AI 2025 Higgs Audio Hackathon. It bundles utilities for preparing media clips, recording user submissions, generating automatic transcripts, and serving similarity scores against curated references.
 
 ## Repository Layout
 
 - `audio_score_server/` – FastAPI service that loads one or more ASR/encoder models, precomputes embeddings for reference clips, and exposes a `/score` endpoint. See the local README for configuration details.
 - `audio_recorder_server/` – FastAPI app with a browser-based recorder UI plus a `/api/recordings` ingestion endpoint. Captured WAV files are written to `audio_recorder_server/recordings/`.
 - `tool/` – Command-line helpers for preparing data (e.g. splitting `.mov` files into segments, extracting WAV stems).
-- `audio_clip/` – Canonical reference audio for each video segment.
-- `video_clip/` – Reference `.mov` clips used to build transcripts/embeddings during score server warm-up.
+- `audio_clip/` – Canonical reference audio for each video segment (mirrors the contents of `audio_recorder_server/recordings/` when testing end-to-end).
+- `video_clip/` – Trimmed `.mov` clips created from the raw footage; these are what the score server transcribes/embeds during warm-up.
+- `video_raw/` – Original long-form recordings kept for archival and for regenerating `video_clip/` segments when the source material changes.
 - `test/` – Smoke-test scripts for exercising the scoring pipeline end-to-end.
+- `requirements.txt` – Python dependencies shared by both services and the helper tools.
 
 ## End-to-End Flow
 
@@ -28,7 +30,6 @@ This workspace contains the tooling used in the Boson AI 2025 Higgs Audio Hackat
 ## Quick Start
 
 ```bash
-cd hackathon
 pip install -r requirements.txt
 # ensure ffmpeg is installed for audio extraction
 ```
@@ -80,7 +81,7 @@ Response:
 {
   "message": "Recording saved.",
   "filename": "U123_PeppaPig-s06e02_part02_20250101T120000.wav",
-  "path": "hackathon/audio_recorder_server/recordings/U123_PeppaPig-s06e02_part02_20250101T120000.wav"
+  "path": "judge_service/audio_recorder_server/recordings/U123_PeppaPig-s06e02_part02_20250101T120000.wav"
 }
 ```
 
