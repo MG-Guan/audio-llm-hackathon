@@ -1,0 +1,29 @@
+version: "3.9"
+
+services:
+  backend:
+    image: dubbing-king-backend:latest
+    container_name: backend
+    ports:
+      - "8000:8000"
+    volumes:
+      - type: bind
+        source: ./data/files.db
+        target: /app/files.db
+      - ./data/uploads:/app/uploads
+    networks:
+      - dubbingnet
+
+  frontend:
+    image: dubbing-king-frontend:latest
+    container_name: frontend
+    ports:
+      - "4200:4200"
+    depends_on:
+      - backend
+    networks:
+      - dubbingnet
+
+networks:
+  dubbingnet:
+    driver: bridge

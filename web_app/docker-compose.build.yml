@@ -1,0 +1,13 @@
+version: "3.9"
+services:
+  frontend:
+    build:
+      context: ./dubbing-king
+      dockerfile: Dockerfile
+    image: dubbing-king-frontend:latest
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: dubbing-king-backend:latest

@@ -1,0 +1,165 @@
+.record-submission {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 1rem;
+}
+
+.video-container {
+    width: 100%;
+    background: #000;
+    aspect-ratio: 16/9;
+    margin-bottom: 0.5rem;
+    border-radius: 8px;
+    overflow: hidden;
+}
+
+.video-player {
+    width: 100%;
+    height: 100%;
+
+    video {
+        width: 100%;
+        height: 100%;
+        object-fit: contain;
+    }
+}
+
+.transcripts {
+    background: rgba(255, 255, 255, 0.9);
+    padding: 1rem 1rem 250px 1rem;
+    border-radius: 12px;
+}
+
+.transcript-item {
+    padding: 0rem;
+    border-bottom: 1px solid var(--surface-border);
+
+    display: flex;
+    flex-direction: row;
+    align-items: flex-start;
+    justify-content: space-between;
+
+    &:last-child {
+        border-bottom: none;
+    }
+
+    .transcript-info {
+        display: flex;
+        flex: 1;
+        flex-direction: column;
+        align-items: center;
+        justify-content: space-between;
+    }
+    
+    .transcript-text-container {
+        flex: 2;
+        margin-left: 1rem;
+    }
+
+    .clip-duration {
+        font-size: 0.9rem;
+        color: var(--text-secondary-color);
+        margin-bottom: 0.5rem;
+    }
+
+    .transcript-text {
+        color: var(--text-color);
+        line-height: 1.5;
+    }
+}
+
+.recording-section {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    width: 100%;
+    height: 250px;
+    background: rgba(255, 255, 255);
+    padding: 1rem;
+    border-top: 1px solid #ccc;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: flex-start;
+}
+
+.recording-controls {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 1rem;
+    padding: 0.5rem;
+}
+
+.recording-status {
+    text-align: center;
+
+    .status-text {
+        font-size: 1.2rem;
+        color: var(--text-color);
+
+        &.recording {
+            color: var(--red-500);
+        }
+    }
+
+    .recording-time {
+        font-size: 1.2rem;
+        font-weight: bold;
+    }
+}
+
+.controls {
+    display: flex;
+    gap: 1rem;
+    justify-content: center;
+    min-height: 4rem;
+    align-items: center;
+}
+
+.record-button {
+    width: 4rem;
+    height: 4rem;
+}
+
+.playback-controls {
+    display: flex;
+    gap: 1rem;
+}
+
+.submitting {
+    font-size: 2rem;
+    color: var(--primary-color);
+}
+
+.recaptcha-container {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 1rem;
+    padding: 1rem;
+
+    h3 {
+        margin: 0;
+        font-size: 1.2rem;
+        color: var(--text-color);
+    }
+}
+
+:host ::ng-deep {
+    .p-button.p-button-rounded {
+        width: 3rem;
+        height: 3rem;
+
+        &.record-button {
+            width: 4rem;
+            height: 4rem;
+        }
+    }
+
+    .recaptcha-dialog {
+        .p-dialog-content {
+            padding: 1rem;
+        }
+    }
+}
